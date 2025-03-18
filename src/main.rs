@@ -31,51 +31,26 @@ Handling dropped connections / cancelled requests:
         - Use tokio::select! to wait for either request completion or connection drop
     Option 3) Axum might just natively handle this and I just implement Drop for cleanup? https://github.com/tokio-rs/axum/discussions/1094
 
+New design:
+- We maintain a queue of tasks, each with an ID
+- When a request comes in, we add a new task to the queue
+- When a request is dropped, we remove it from the queue if it hasn't been taken for processing yet
+- The worker pool consumes tasks in the queue, processes them, and adds the result to an output queue
+    - Or do we use a channel and send it down there?
 
 */
 
-use std::sync::Arc;
-use std::time::Duration;
+pub mod task;
+
+use std::sync::{Arc, Mutex};
 
 use axum::extract::{Json, State};
-use axum::{routing::post, Router};
+use axum::{Router, routing::post};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
+use task::{CancellationGuard, Task, TaskProcessor};
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
-use tokio::time::sleep;
 use tracing::info;
-
-/// Pool of LLM workers
-struct WorkerPool {
-    workers: Vec<()>,
-    permits: Semaphore,
-}
-
-impl WorkerPool {
-    fn new(num_workers: usize) -> Self {
-        Self {
-            workers: vec![(); num_workers],
-            permits: Semaphore::new(num_workers),
-        }
-    }
-
-    /// Predict with the LLM
-    async fn predict(&self, prompt: &str) -> String {
-        // Semaphore so we can have N concurrent tasks
-        let _permit = self
-            .permits
-            .acquire()
-            .await
-            .expect("Sempahore has been closed.");
-
-        // Simulate some processing
-        sleep(Duration::from_secs(1)).await;
-        let response = format!("Ping {:?} -> Pong\n", prompt);
-
-        response
-    }
-}
 
 #[derive(Deserialize)]
 struct Prompt {
@@ -84,11 +59,23 @@ struct Prompt {
 
 /// Submit a prompt to be processed by the LLM
 async fn post_submit(
-    State(workers): State<Arc<WorkerPool>>,
+    State(workers): State<Arc<Mutex<TaskProcessor>>>,
     Json(payload): Json<Prompt>,
 ) -> Json<Value> {
     info!("Recieved request");
-    let response = workers.predict(&payload.prompt).await;
+
+    let (task, rx) = Task::new(payload.prompt);
+    let _guard = CancellationGuard {
+        task_id: task.id,
+        task_processor: workers.clone(),
+    };
+    workers
+        .lock()
+        .expect("Failed to lock worker pool")
+        .submit_task(task);
+
+    let response = rx.await.expect("Error receiving result");
+
     info!("Finished request");
 
     Json(json!({"response": response}))
@@ -100,11 +87,11 @@ async fn main() {
 
     tracing_subscriber::fmt::init();
 
-    let workers = Arc::new(WorkerPool::new(2));
+    let worker_pool = Arc::new(Mutex::new(TaskProcessor::new(2)));
 
     let app = Router::new()
         .route("/submit", post(post_submit))
-        .with_state(workers);
+        .with_state(worker_pool);
 
     let listener = TcpListener::bind("0.0.0.0:3000").await.unwrap();
     axum::serve(listener, app).await.unwrap();
